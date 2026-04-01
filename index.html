@@ -1,0 +1,606 @@
+import { useState, useEffect, useRef } from "react";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const NETWORKS = {
+  MTN:     { label: "MTN MoMo",     color: "#F59E0B", bg: "#FEF3C7", text: "#92400E", short: "MTN" },
+  TELECEL: { label: "Telecel Cash", color: "#EF4444", bg: "#FEE2E2", text: "#991B1B", short: "TEL" },
+  AT:      { label: "AT Money",     color: "#3B82F6", bg: "#DBEAFE", text: "#1E40AF", short: "AT"  },
+};
+
+const STATUSES = {
+  settled: { label: "Settled", color: "#15803D", bg: "#DCFCE7" },
+  pending:  { label: "Pending", color: "#B45309", bg: "#FEF3C7" },
+  failed:   { label: "Failed",  color: "#B91C1C", bg: "#FEE2E2" },
+};
+
+const FIRST_NAMES = ["Abena","Kwame","Yaa","Fiifi","Ama","Kofi","Akosua","Nana","Efua","Kojo","Adwoa","Kweku","Afia","Kwabena","Esi"];
+const LAST_NAMES  = ["Mensah","Ofori","Asantewaa","Baah","Darko","Boateng","Frimpong","Asante","Poku","Antwi","Owusu","Yeboah","Acheampong","Asamoah","Nyarko"];
+
+const ALERT_TEMPLATES = [
+  { type: "danger",  color: "#EF4444", msg: "AT Money settlement delayed — 3 txns pending >2h" },
+  { type: "warning", color: "#F59E0B", msg: "Unusual spike — 8 txns in 4 mins from same number" },
+  { type: "info",    color: "#3B82F6", msg: "MTN MoMo daily limit 85% reached (GH₵ 8,500 / 10,000)" },
+  { type: "success", color: "#22C55E", msg: "Daily reconciliation complete — GH₵ 4,120 matched" },
+];
+
+const SPARKDATA = {
+  total:   [690,900,630,1140,1010,1290,1180,1440,1310,1640,1520,1750],
+  count:   [4,6,5,8,7,9,8,10,9,11,10,12],
+  avg:     [72,68,75,70,74,73,76,74,77,75,78,76],
+  failed:  [1,0,2,1,0,1,2,1,0,2,1,2],
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function seededRng(seed) {
+  let s = seed;
+  return () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff; };
+}
+
+function generateTxns(seed = 42) {
+  const rng = seededRng(seed);
+  const nets     = ["MTN","MTN","MTN","MTN","TELECEL","TELECEL","AT"];
+  const statuses = ["settled","settled","settled","settled","settled","pending","failed"];
+  const txns = [];
+  const now  = new Date();
+  for (let i = 0; i < 40; i++) {
+    const mins = i * 14 + Math.floor(rng() * 8);
+    const d    = new Date(now - mins * 60000);
+    const net  = nets[Math.floor(rng() * nets.length)];
+    const status = statuses[Math.floor(rng() * statuses.length)];
+    const amt  = Math.round((rng() * 480 + 20) / 5) * 5;
+    const fn   = FIRST_NAMES[Math.floor(rng() * FIRST_NAMES.length)];
+    const ln   = LAST_NAMES[Math.floor(rng() * LAST_NAMES.length)];
+    txns.push({
+      id: `TX${1000 + i}`,
+      name: `${fn} ${ln}`,
+      phone: `+233 ${net==="MTN"?"24":net==="TELECEL"?"50":"26"} ··· ${String(Math.floor(rng()*9000)+1000)}`,
+      network: net,
+      status,
+      amount: amt,
+      time: d,
+    });
+  }
+  return txns;
+}
+
+function calcMetrics(txns) {
+  const settled = txns.filter(t => t.status === "settled");
+  const total   = settled.reduce((s,t) => s+t.amount, 0);
+  const failed  = txns.filter(t => t.status === "failed").length;
+  const avg     = settled.length ? total/settled.length : 0;
+  const net     = { MTN:0, TELECEL:0, AT:0 };
+  const netCount= { MTN:0, TELECEL:0, AT:0 };
+  settled.forEach(t => net[t.network] += t.amount);
+  txns.forEach(t => netCount[t.network]++);
+  return { total, count: txns.length, failed, avg, net, netCount };
+}
+
+function fmtTime(d) { return d.toLocaleTimeString("en-GH",{hour:"2-digit",minute:"2-digit"}); }
+function fmtDate(d) { return d.toLocaleDateString("en-GH",{weekday:"short",day:"numeric",month:"short",year:"numeric"}); }
+
+// ─── Tiny sub-components ──────────────────────────────────────────────────────
+
+function Sparkline({ data, color }) {
+  const w=120,h=36, max=Math.max(...data,1);
+  const pts = data.map((v,i)=>`${(i/(data.length-1))*w},${h-(v/max)*h}`).join(" ");
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{display:"block"}}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function DonutChart({ data }) {
+  const total = data.reduce((s,d)=>s+d.value,0);
+  let cum=0; const cx=54,cy=54,r=40,sw=16;
+  const paths = data.map(d=>{
+    const pct=d.value/total, sa=cum*2*Math.PI-Math.PI/2, ea=(cum+pct)*2*Math.PI-Math.PI/2;
+    cum+=pct;
+    return <path key={d.label} d={`M ${cx+r*Math.cos(sa)} ${cy+r*Math.sin(sa)} A ${r} ${r} 0 ${pct>0.5?1:0} 1 ${cx+r*Math.cos(ea)} ${cy+r*Math.sin(ea)}`} fill="none" stroke={d.color} strokeWidth={sw} strokeLinecap="butt"/>;
+  });
+  return (
+    <svg width={108} height={108} viewBox="0 0 108 108">
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#F1F5F9" strokeWidth={sw}/>
+      {paths}
+      <text x={cx} y={cy-6}  textAnchor="middle" fontSize="11" fill="#64748B" fontFamily="'DM Sans',sans-serif">Total</text>
+      <text x={cx} y={cy+10} textAnchor="middle" fontSize="13" fontWeight="600" fill="#0F172A" fontFamily="'DM Sans',sans-serif">{total}</text>
+      <text x={cx} y={cy+22} textAnchor="middle" fontSize="9"  fill="#94A3B8" fontFamily="'DM Sans',sans-serif">txns</text>
+    </svg>
+  );
+}
+
+function BarChart({ data, max }) {
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {data.map(d=>{
+        const pct=max?(d.value/max)*100:0;
+        return (
+          <div key={d.label} style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{width:64,fontSize:12,color:"#64748B",flexShrink:0}}>{d.label}</span>
+            <div style={{flex:1,height:10,background:"#F1F5F9",borderRadius:99,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:d.color,borderRadius:99,transition:"width 0.8s cubic-bezier(.4,0,.2,1)"}}/>
+            </div>
+            <span style={{width:52,fontSize:12,fontWeight:600,color:"#0F172A",textAlign:"right",flexShrink:0,fontFamily:"'DM Mono',monospace"}}>
+              GH₵{d.value>=1000?`${(d.value/1000).toFixed(1)}k`:d.value}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Auth Screen ──────────────────────────────────────────────────────────────
+
+function AuthScreen({ onLogin }) {
+  const [mode, setMode]     = useState("login"); // "login" | "register"
+  const [name, setName]     = useState("");
+  const [business, setBusiness] = useState("");
+  const [city, setCity]     = useState("Accra");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError]   = useState("");
+  const [loading, setLoading] = useState(false);
+  const [show, setShow]     = useState(false);
+
+  useEffect(() => { setTimeout(()=>setShow(true),60); }, []);
+
+  async function handleSubmit() {
+    setError(""); setLoading(true);
+    if (!username.trim() || !password.trim()) { setError("Please fill in all fields."); setLoading(false); return; }
+
+    try {
+      const usersRaw = await window.storage.get("users");
+      const users = usersRaw ? JSON.parse(usersRaw.value) : {};
+
+      if (mode === "register") {
+        if (!name.trim() || !business.trim()) { setError("Please fill in all fields."); setLoading(false); return; }
+        if (users[username]) { setError("Username already taken."); setLoading(false); return; }
+        const newUser = { username, password, name: name.trim(), business: business.trim(), city: city.trim(), seed: Date.now() };
+        users[username] = newUser;
+        await window.storage.set("users", JSON.stringify(users));
+        onLogin(newUser);
+      } else {
+        const user = users[username];
+        if (!user || user.password !== password) { setError("Invalid username or password."); setLoading(false); return; }
+        onLogin(user);
+      }
+    } catch (e) {
+      if (mode === "register") {
+        // storage might not have users key yet
+        const newUser = { username, password, name: name.trim()||username, business: business.trim()||"My Business", city: city.trim()||"Accra", seed: Date.now() };
+        await window.storage.set("users", JSON.stringify({ [username]: newUser }));
+        onLogin(newUser);
+      } else {
+        setError("No account found. Please register first.");
+      }
+    }
+    setLoading(false);
+  }
+
+  const inp = (val, set, ph, type="text") => (
+    <input
+      type={type} value={val} onChange={e=>set(e.target.value)} placeholder={ph}
+      onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
+      style={{
+        width:"100%", padding:"11px 14px", borderRadius:10, border:"1.5px solid #E2E8F0",
+        fontSize:14, color:"#0F172A", background:"#F8FAFC", outline:"none",
+        fontFamily:"'DM Sans',sans-serif", boxSizing:"border-box",
+        transition:"border 0.2s",
+      }}
+      onFocus={e=>e.target.style.borderColor="#0F172A"}
+      onBlur={e=>e.target.style.borderColor="#E2E8F0"}
+    />
+  );
+
+  return (
+    <div style={{minHeight:"100vh",background:"#0F172A",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif",padding:20}}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+      <div style={{
+        width:"100%", maxWidth:420, background:"#fff", borderRadius:20, padding:"36px 36px 32px",
+        boxShadow:"0 24px 80px rgba(0,0,0,0.25)",
+        opacity: show?1:0, transform: show?"translateY(0)":"translateY(24px)",
+        transition:"opacity 0.5s ease, transform 0.5s ease",
+      }}>
+        {/* Logo */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:28}}>
+          <div style={{width:40,height:40,borderRadius:10,background:"linear-gradient(135deg,#F59E0B,#EF4444)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <span style={{fontSize:18,fontWeight:700,color:"#fff"}}>₵</span>
+          </div>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:"#0F172A",letterSpacing:"-0.02em"}}>MoMo Dashboard</div>
+            <div style={{fontSize:11,color:"#94A3B8"}}>Ghana Mobile Money Analytics</div>
+          </div>
+        </div>
+
+        {/* Mode toggle */}
+        <div style={{display:"flex",background:"#F1F5F9",borderRadius:10,padding:3,marginBottom:24}}>
+          {["login","register"].map(m=>(
+            <button key={m} onClick={()=>{setMode(m);setError("");}} style={{
+              flex:1,padding:"7px 0",borderRadius:8,border:"none",cursor:"pointer",
+              background:mode===m?"#fff":"transparent",
+              color:mode===m?"#0F172A":"#64748B",
+              fontWeight:mode===m?600:400, fontSize:13, fontFamily:"'DM Sans',sans-serif",
+              boxShadow:mode===m?"0 1px 3px rgba(0,0,0,0.1)":"none", transition:"all 0.2s",
+            }}>{m==="login"?"Sign in":"Create account"}</button>
+          ))}
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {mode==="register" && <>
+            {inp(name, setName, "Your full name")}
+            {inp(business, setBusiness, "Business name")}
+            {inp(city, setCity, "City (e.g. Accra)")}
+          </>}
+          {inp(username, setUsername, "Username")}
+          {inp(password, setPassword, "Password", "password")}
+        </div>
+
+        {error && <div style={{marginTop:12,fontSize:13,color:"#B91C1C",background:"#FEE2E2",padding:"8px 12px",borderRadius:8}}>{error}</div>}
+
+        <button onClick={handleSubmit} disabled={loading} style={{
+          width:"100%",marginTop:18,padding:"12px 0",borderRadius:10,border:"none",
+          background:"#0F172A",color:"#fff",fontSize:14,fontWeight:600,cursor:"pointer",
+          fontFamily:"'DM Sans',sans-serif",opacity:loading?0.6:1,transition:"opacity 0.2s",
+        }}>
+          {loading?"Please wait…":mode==="login"?"Sign in →":"Create account →"}
+        </button>
+
+        <p style={{marginTop:16,fontSize:12,color:"#94A3B8",textAlign:"center"}}>
+          {mode==="login"?"Don't have an account? ":"Already have an account? "}
+          <span onClick={()=>{setMode(mode==="login"?"register":"login");setError("");}} style={{color:"#0F172A",fontWeight:600,cursor:"pointer",textDecoration:"underline"}}>
+            {mode==="login"?"Register":"Sign in"}
+          </span>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Profile Edit Modal ───────────────────────────────────────────────────────
+
+function ProfileModal({ user, onClose, onSave }) {
+  const [name, setName]         = useState(user.name);
+  const [business, setBusiness] = useState(user.business);
+  const [city, setCity]         = useState(user.city||"Accra");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving]     = useState(false);
+
+  async function save() {
+    setSaving(true);
+    try {
+      const usersRaw = await window.storage.get("users");
+      const users = usersRaw ? JSON.parse(usersRaw.value) : {};
+      const updated = { ...user, name, business, city, ...(password?{password}:{}) };
+      users[user.username] = updated;
+      await window.storage.set("users", JSON.stringify(users));
+      onSave(updated);
+    } catch(e) { onSave({...user,name,business,city}); }
+    setSaving(false);
+  }
+
+  const inp = (label, val, set, ph, type="text") => (
+    <div>
+      <div style={{fontSize:11,color:"#64748B",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:5}}>{label}</div>
+      <input type={type} value={val} onChange={e=>set(e.target.value)} placeholder={ph} style={{
+        width:"100%",padding:"10px 13px",borderRadius:9,border:"1.5px solid #E2E8F0",
+        fontSize:14,color:"#0F172A",background:"#F8FAFC",outline:"none",
+        fontFamily:"'DM Sans',sans-serif",boxSizing:"border-box",
+      }}
+      onFocus={e=>e.target.style.borderColor="#0F172A"}
+      onBlur={e=>e.target.style.borderColor="#E2E8F0"}
+      />
+    </div>
+  );
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20}} onClick={onClose}>
+      <div style={{background:"#fff",borderRadius:16,padding:28,width:"100%",maxWidth:380,boxShadow:"0 24px 60px rgba(0,0,0,0.2)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{fontSize:15,fontWeight:700,color:"#0F172A",marginBottom:20}}>Edit Profile</div>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {inp("Full name",name,setName,"Your name")}
+          {inp("Business name",business,setBusiness,"Business name")}
+          {inp("City",city,setCity,"City")}
+          {inp("New password (optional)",password,setPassword,"Leave blank to keep current","password")}
+        </div>
+        <div style={{display:"flex",gap:10,marginTop:22}}>
+          <button onClick={onClose} style={{flex:1,padding:"10px 0",border:"1.5px solid #E2E8F0",borderRadius:9,background:"#fff",color:"#64748B",fontSize:13,fontWeight:500,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>Cancel</button>
+          <button onClick={save} disabled={saving} style={{flex:2,padding:"10px 0",border:"none",borderRadius:9,background:"#0F172A",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",opacity:saving?0.6:1}}>
+            {saving?"Saving…":"Save changes"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Dashboard ───────────────────────────────────────────────────────────
+
+function Dashboard({ user, onLogout, onEditProfile }) {
+  const [period, setPeriod]     = useState("today");
+  const [netFilter, setNetFilter] = useState("ALL");
+  const [animIn, setAnimIn]     = useState(false);
+  const [now]                   = useState(new Date());
+  const txns                    = generateTxns(user.seed || 42);
+  const filtered = netFilter==="ALL" ? txns : txns.filter(t=>t.network===netFilter);
+  const metrics  = calcMetrics(filtered);
+  const totalNet = metrics.net.MTN + metrics.net.TELECEL + metrics.net.AT;
+  const netBarData = [
+    { label:"MTN MoMo", value:metrics.net.MTN,     color:NETWORKS.MTN.color     },
+    { label:"Telecel",  value:metrics.net.TELECEL,  color:NETWORKS.TELECEL.color },
+    { label:"AT Money", value:metrics.net.AT,       color:NETWORKS.AT.color      },
+  ];
+  const donutData = [
+    { label:"MTN", value:metrics.netCount.MTN,     color:NETWORKS.MTN.color     },
+    { label:"TEL", value:metrics.netCount.TELECEL,  color:NETWORKS.TELECEL.color },
+    { label:"AT",  value:metrics.netCount.AT,       color:NETWORKS.AT.color      },
+  ];
+
+  useEffect(()=>{ setTimeout(()=>setAnimIn(true),60); },[]);
+
+  const card = (delay) => ({
+    background:"#fff", borderRadius:16, border:"1px solid #E2E8F0", padding:"20px 22px",
+    opacity:animIn?1:0, transform:animIn?"translateY(0)":"translateY(18px)",
+    transition:`opacity 0.5s ease ${delay}ms, transform 0.5s ease ${delay}ms`,
+  });
+
+  const initials = user.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
+
+  return (
+    <div style={{fontFamily:"'DM Sans',sans-serif",background:"#F8FAFC",minHeight:"100vh",paddingBottom:40}}>
+      {/* Header */}
+      <div style={{background:"#0F172A",padding:"0 28px",display:"flex",alignItems:"center",justifyContent:"space-between",height:60,position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <div style={{width:32,height:32,borderRadius:8,background:"linear-gradient(135deg,#F59E0B,#EF4444)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>₵</span>
+          </div>
+          <div>
+            <div style={{fontSize:14,fontWeight:700,color:"#F1F5F9",letterSpacing:"-0.01em"}}>MoMo Dashboard</div>
+            <div style={{fontSize:11,color:"#64748B"}}>{user.business} · {user.city}</div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,background:"#1E293B",borderRadius:8,padding:"5px 12px"}}>
+            <div style={{width:7,height:7,borderRadius:"50%",background:"#22C55E",boxShadow:"0 0 6px #22C55E"}}/>
+            <span style={{fontSize:12,color:"#94A3B8",fontWeight:500}}>Live</span>
+          </div>
+          <span style={{fontSize:12,color:"#475569"}}>{fmtDate(now)}</span>
+          {/* User avatar */}
+          <div style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}} onClick={onEditProfile}>
+            <div style={{width:32,height:32,borderRadius:"50%",background:"linear-gradient(135deg,#6366F1,#EC4899)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#fff"}}>
+              {initials}
+            </div>
+            <div style={{display:"flex",flexDirection:"column"}}>
+              <span style={{fontSize:12,color:"#F1F5F9",fontWeight:600,lineHeight:1.2}}>{user.name.split(" ")[0]}</span>
+              <span style={{fontSize:10,color:"#64748B",lineHeight:1}}>Edit profile</span>
+            </div>
+          </div>
+          <button onClick={onLogout} style={{padding:"5px 14px",border:"1px solid #334155",borderRadius:7,background:"transparent",color:"#94A3B8",fontSize:12,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",fontWeight:500}}>
+            Sign out
+          </button>
+        </div>
+      </div>
+
+      <div style={{maxWidth:1100,margin:"0 auto",padding:"24px 20px 0"}}>
+        {/* Filters */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
+          <div style={{display:"flex",gap:4,background:"#E2E8F0",borderRadius:10,padding:3}}>
+            {["today","week","month"].map(p=>(
+              <button key={p} onClick={()=>setPeriod(p)} style={{
+                padding:"6px 16px",borderRadius:8,border:"none",cursor:"pointer",
+                background:period===p?"#fff":"transparent",
+                color:period===p?"#0F172A":"#64748B",
+                fontWeight:period===p?600:400, fontSize:13, fontFamily:"'DM Sans',sans-serif",
+                boxShadow:period===p?"0 1px 3px rgba(0,0,0,0.1)":"none", transition:"all 0.2s",
+              }}>{p==="today"?"Today":p==="week"?"This week":"This month"}</button>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            {["ALL","MTN","TELECEL","AT"].map(n=>(
+              <button key={n} onClick={()=>setNetFilter(n)} style={{
+                padding:"5px 14px",borderRadius:8,
+                border:`1.5px solid ${netFilter===n?(n==="ALL"?"#0F172A":NETWORKS[n]?.color):"#E2E8F0"}`,
+                background:netFilter===n?(n==="ALL"?"#0F172A":NETWORKS[n]?.bg):"#fff",
+                color:netFilter===n?(n==="ALL"?"#fff":NETWORKS[n]?.text):"#64748B",
+                fontWeight:netFilter===n?600:400, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif",
+                transition:"all 0.2s",
+              }}>{n==="ALL"?"All networks":NETWORKS[n].label}</button>
+            ))}
+          </div>
+        </div>
+
+        {/* Metric cards */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:12,marginBottom:16}}>
+          {[
+            { label:"Total received", val:`GH₵ ${metrics.total.toLocaleString("en-GH",{minimumFractionDigits:0})}`, sub:"↑ 12% vs yesterday", subColor:"#15803D", spark:SPARKDATA.total, sColor:"#0F172A" },
+            { label:"Transactions", val:metrics.count, sub:`${Math.abs(metrics.count-55)} ${metrics.count>55?"more than":"less than"} avg`, subColor:metrics.count>55?"#15803D":"#B91C1C", spark:SPARKDATA.count, sColor:"#3B82F6" },
+            { label:"Avg. ticket", val:`GH₵ ${metrics.avg.toFixed(0)}`, sub:"— steady", subColor:"#64748B", spark:SPARKDATA.avg, sColor:"#F59E0B" },
+            { label:"Failed payments", val:metrics.failed, sub:`↑ 1 more than usual`, subColor:"#B91C1C", spark:SPARKDATA.failed, sColor:"#EF4444" },
+          ].map((m,i)=>(
+            <div key={m.label} style={{...card(80+i*60),display:"flex",flexDirection:"column",gap:0}}>
+              <div style={{fontSize:11,color:"#94A3B8",fontWeight:500,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>{m.label}</div>
+              <div style={{fontSize:22,fontWeight:700,color:"#0F172A",letterSpacing:"-0.02em",marginBottom:4}}>{m.val}</div>
+              <div style={{fontSize:11,color:m.subColor,marginBottom:10}}>{m.sub}</div>
+              <div style={{marginTop:"auto"}}><Sparkline data={m.spark} color={m.sColor}/></div>
+            </div>
+          ))}
+        </div>
+
+        {/* Main grid */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 380px",gap:12}}>
+
+          {/* Transaction feed */}
+          <div style={{...card(240),overflow:"hidden"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#0F172A",textTransform:"uppercase",letterSpacing:"0.05em"}}>Transaction feed</div>
+              <span style={{fontSize:11,color:"#94A3B8"}}>{filtered.length} transactions</span>
+            </div>
+            <div style={{overflowY:"auto",maxHeight:420}}>
+              <table style={{width:"100%",borderCollapse:"collapse"}}>
+                <thead>
+                  <tr style={{borderBottom:"1px solid #F1F5F9"}}>
+                    {["Customer","Network","Amount","Status","Time"].map(h=>(
+                      <th key={h} style={{padding:"0 8px 10px",textAlign:h==="Amount"||h==="Time"?"right":"left",fontSize:11,color:"#94A3B8",fontWeight:500,textTransform:"uppercase",letterSpacing:"0.06em"}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.slice(0,18).map((tx,i)=>{
+                    const net=NETWORKS[tx.network], st=STATUSES[tx.status];
+                    return (
+                      <tr key={tx.id} style={{borderBottom:"1px solid #F8FAFC",opacity:animIn?1:0,transform:animIn?"translateX(0)":"translateX(-12px)",transition:`opacity 0.4s ease ${300+i*30}ms, transform 0.4s ease ${300+i*30}ms`}}>
+                        <td style={{padding:"9px 8px"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:9}}>
+                            <div style={{width:30,height:30,borderRadius:"50%",background:net.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:net.text,flexShrink:0}}>
+                              {tx.name.split(" ").map(w=>w[0]).join("").slice(0,2)}
+                            </div>
+                            <div>
+                              <div style={{fontSize:13,fontWeight:500,color:"#0F172A"}}>{tx.name}</div>
+                              <div style={{fontSize:11,color:"#94A3B8",fontFamily:"'DM Mono',monospace"}}>{tx.phone}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td style={{padding:"9px 8px"}}><span style={{fontSize:11,fontWeight:600,color:net.text,background:net.bg,padding:"2px 7px",borderRadius:5}}>{net.short}</span></td>
+                        <td style={{padding:"9px 8px",textAlign:"right"}}><span style={{fontSize:13,fontWeight:600,color:tx.status==="failed"?"#B91C1C":"#0F172A",fontFamily:"'DM Mono',monospace"}}>{tx.status==="failed"?"—":`GH₵ ${tx.amount}`}</span></td>
+                        <td style={{padding:"9px 8px"}}><span style={{fontSize:11,fontWeight:500,color:st.color,background:st.bg,padding:"2px 8px",borderRadius:5}}>{st.label}</span></td>
+                        <td style={{padding:"9px 8px",textAlign:"right",fontSize:12,color:"#94A3B8",fontFamily:"'DM Mono',monospace"}}>{fmtTime(tx.time)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Right column */}
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+            {/* Network split */}
+            <div style={card(300)}>
+              <div style={{fontSize:13,fontWeight:600,color:"#0F172A",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:16}}>Network split</div>
+              <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:18}}>
+                <DonutChart data={donutData}/>
+                <div style={{flex:1,display:"flex",flexDirection:"column",gap:8}}>
+                  {donutData.map(d=>{
+                    const pct=metrics.count?Math.round((d.value/metrics.count)*100):0;
+                    return (
+                      <div key={d.label} style={{display:"flex",alignItems:"center",gap:8}}>
+                        <div style={{width:8,height:8,borderRadius:"50%",background:d.color,flexShrink:0}}/>
+                        <span style={{fontSize:12,color:"#64748B",flex:1}}>{NETWORKS[d.label]?.label||d.label}</span>
+                        <span style={{fontSize:13,fontWeight:600,color:"#0F172A"}}>{pct}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <BarChart data={netBarData} max={totalNet}/>
+            </div>
+
+            {/* Alerts */}
+            <div style={card(380)}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#0F172A",textTransform:"uppercase",letterSpacing:"0.05em"}}>Alerts</div>
+                <span style={{fontSize:11,background:"#FEE2E2",color:"#B91C1C",padding:"2px 8px",borderRadius:5,fontWeight:600}}>2 critical</span>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {ALERT_TEMPLATES.map((a,i)=>(
+                  <div key={i} style={{
+                    display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",borderRadius:10,
+                    background:i===0?"#FFF5F5":i===1?"#FFFBEB":"transparent",
+                    borderLeft:`3px solid ${a.color}`, marginBottom:2,
+                    opacity:animIn?1:0, transform:animIn?"translateX(0)":"translateX(10px)",
+                    transition:`opacity 0.4s ease ${500+i*80}ms, transform 0.4s ease ${500+i*80}ms`,
+                  }}>
+                    <div style={{width:7,height:7,borderRadius:"50%",background:a.color,marginTop:5,flexShrink:0}}/>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:12,color:"#1E293B",lineHeight:1.5}}>{a.msg}</div>
+                      <div style={{fontSize:11,color:"#94A3B8",marginTop:2,fontFamily:"'DM Mono',monospace"}}>
+                        {fmtTime(new Date(Date.now() - i*18*60000))}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Reconciliation */}
+            <div style={card(460)}>
+              <div style={{fontSize:13,fontWeight:600,color:"#0F172A",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:12}}>Reconciliation</div>
+              {[
+                { label:"Matched",   val:`GH₵ ${(metrics.total*0.94).toFixed(0)}`, pct:94, color:"#22C55E" },
+                { label:"Unmatched", val:`GH₵ ${(metrics.total*0.04).toFixed(0)}`, pct:4,  color:"#F59E0B" },
+                { label:"Disputed",  val:`GH₵ ${(metrics.total*0.02).toFixed(0)}`, pct:2,  color:"#EF4444" },
+              ].map(r=>(
+                <div key={r.label} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                  <span style={{width:70,fontSize:12,color:"#64748B",flexShrink:0}}>{r.label}</span>
+                  <div style={{flex:1,height:6,background:"#F1F5F9",borderRadius:99,overflow:"hidden"}}>
+                    <div style={{width:`${r.pct}%`,height:"100%",background:r.color,borderRadius:99}}/>
+                  </div>
+                  <span style={{fontSize:12,fontWeight:600,color:"#0F172A",width:72,textAlign:"right",flexShrink:0,fontFamily:"'DM Mono',monospace"}}>{r.val}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Root App ─────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [user, setUser]           = useState(null);
+  const [checking, setChecking]   = useState(true);
+  const [showProfile, setShowProfile] = useState(false);
+
+  // Auto-restore session from storage
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await window.storage.get("session");
+        if (raw) { const s = JSON.parse(raw.value); setUser(s); }
+      } catch(e) {}
+      setChecking(false);
+    })();
+  }, []);
+
+  async function handleLogin(u) {
+    setUser(u);
+    await window.storage.set("session", JSON.stringify(u));
+  }
+
+  async function handleLogout() {
+    setUser(null);
+    try { await window.storage.delete("session"); } catch(e) {}
+  }
+
+  async function handleSaveProfile(u) {
+    setUser(u);
+    setShowProfile(false);
+    await window.storage.set("session", JSON.stringify(u));
+  }
+
+  if (checking) {
+    return (
+      <div style={{minHeight:"100vh",background:"#0F172A",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
+        <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+        <div style={{textAlign:"center"}}>
+          <div style={{width:44,height:44,borderRadius:12,background:"linear-gradient(135deg,#F59E0B,#EF4444)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:20,fontWeight:700,color:"#fff"}}>₵</div>
+          <div style={{color:"#64748B",fontSize:13}}>Loading your dashboard…</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) return <AuthScreen onLogin={handleLogin}/>;
+
+  return (
+    <>
+      <Dashboard user={user} onLogout={handleLogout} onEditProfile={()=>setShowProfile(true)}/>
+      {showProfile && <ProfileModal user={user} onClose={()=>setShowProfile(false)} onSave={handleSaveProfile}/>}
+    </>
+  );
+}
